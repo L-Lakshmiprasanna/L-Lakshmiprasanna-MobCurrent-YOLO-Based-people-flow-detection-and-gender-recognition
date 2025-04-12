@@ -1,0 +1,123 @@
+main_code.py 
+app = Flask(__name__) 
+UPLOAD_FOLDER = 'uploads' 
+PROCESSED_FOLDER = 'static/processed' 
+os.makedirs(UPLOAD_FOLDER, exist_ok=True) 
+os.makedirs(PROCESSED_FOLDER, exist_ok=True) 
+@app.route('/') 
+def home(): 
+return render_template('index.html') 
+@app.route('/upload', methods=['GET', 'POST']) 
+def upload(): 
+if request.method == 'POST': 
+if 'video' not in request.files: 
+return "No video uploaded", 400 
+file = request.files['video'] 
+filepath = os.path.join(UPLOAD_FOLDER, file.filename) 
+processed_video_path = os.path.join(PROCESSED_FOLDER, file.filename) 
+file.save(filepath) 
+result = subprocess.run(['python', 'sub_process_code.py', filepath, processed_video_path], 
+capture_output=True, text=True) 
+output_lines = result.stdout.strip().split("\n")
+unique_persons = output_lines[-1] 
+return render_template('detect.html', video_url=url_for('static', 
+filename=f'processed/{file.filename}'), unique_persons=unique_persons) 
+return render_template('upload.html') 
+@app.route('/detect') 
+def detect(): 
+return redirect(url_for('upload')) 
+@app.route('/statistics') 
+def statistics(): 
+return render_template('statistics.html') 
+@app.route('/generate_chart') 
+def chart_page(): 
+csv_file = "person_count_day_wise.csv" 
+if not os.path.exists(csv_file): 
+return "<h3>CSV file not found</h3>" 
+df = pd.read_csv(csv_file) 
+df.columns = df.columns.str.strip() 
+df['date_time'] = pd.to_datetime(df['date_time'], format='%d/%m/%Y') 
+df_aggregated = df.groupby('date_time', as_index=False)['count'].sum() 
+fig = px.bar(df_aggregated, x='date_time', y='count', labels={'date_time': 'Date', 'count': 'Person 
+Count'}, title="Daily Person Count", hover_data={'date_time': True, 'count': True}) 
+chart_html = pio.to_html(fig, full_html=True)
+return chart_html 
+@app.route('/help') 
+def help(): 
+return render_template('help.html') 
+if __name__ == '__main__': 
+app.run(host='0.0.0.0', port=8057, debug=True) 
+sub_process_code.py 
+import cv2 
+import sys 
+from ultralytics import YOLO 
+from deep_sort_realtime.deepsort_tracker import DeepSort 
+from datetime import datetime 
+import pandas as pd 
+import os 
+if len(sys.argv) < 3: 
+print("Error: Missing arguments. Expected input video and output path.") 
+sys.exit(1) 
+video_path = sys.argv[1] 
+output_path = sys.argv[2] 
+model = YOLO("yolov8m.pt") 
+tracker = DeepSort(max_age=30, n_init=2)
+cap = cv2.VideoCapture(video_path) 
+if not cap.isOpened(): 
+print("Error: Could not open video.") 
+sys.exit(1) 
+frame_width = int(cap.get(3)) 
+frame_height = int(cap.get(4)) 
+fps = int(cap.get(cv2.CAP_PROP_FPS)) 
+fourcc = cv2.VideoWriter_fourcc(*'avc1') 
+out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height)) 
+unique_person_ids = set() 
+frame_skip = 3 
+frame_count = 0 
+while cap.isOpened(): 
+ret, frame = cap.read() 
+if not ret: 
+break 
+frame_count += 1 
+if frame_count % frame_skip != 0: 
+continue 
+results = model(frame) 
+detections = []
+for result in results: 
+for box in result.boxes: 
+cls = int(box.cls[0]) 
+conf = float(box.conf[0]) 
+xyxy = box.xyxy[0].tolist() 
+if cls == 0 and conf > 0.5: 
+x1, y1, x2, y2 = xyxy 
+detections.append(([x1, y1, x2 - x1, y2 - y1], conf)) 
+tracks = tracker.update_tracks(detections, frame=frame) 
+for track in tracks: 
+if not track.is_confirmed(): 
+continue 
+track_id = track.track_id 
+ltrb = track.to_ltrb() 
+x1, y1, x2, y2 = map(int, ltrb) 
+cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2) 
+cv2.putText(frame, f"ID: {track_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
+(255, 0, 0), 2) 
+if track_id not in unique_person_ids: 
+unique_person_ids.add(track_id) 
+person_count = len(unique_person_ids)
+cv2.putText(frame, f"Unique Persons: {person_count}", (50, 50), 
+cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2) 
+cv2.imshow("YOLO + DeepSORT Person Tracking", frame) 
+if cv2.waitKey(1) & 0xFF == ord('q'): 
+break 
+out.write(frame) 
+cap.release() 
+out.release() 
+print(f"{len(unique_person_ids)}") 
+csv_file = "person_count_day_wise.csv" 
+current_time = datetime.now().strftime("%d/%m/%Y") 
+new_data = pd.DataFrame([[current_time, len(unique_person_ids)]], columns=["date_time", 
+"count"]) 
+if not os.path.exists(csv_file): 
+new_data.to_csv(csv_file, index=False) 
+else: 
+new_data.to_csv(csv_file, mode='a', header=False, index=False)
